@@ -14,6 +14,8 @@
 #     --root-pass=HASLO  ustaw inne hasło roota niż domyślne
 #     --no-root-pass     nie zmieniaj hasła roota
 #
+#  Skrypt sam naprawia typowe problemy z internetem (karta wyłączona,
+#  brak adresu IP z DHCP, brak trasy domyślnej, brak DNS).
 #  Skrypt można uruchamiać wielokrotnie (jest idempotentny).
 # =====================================================================
 set -euo pipefail
@@ -102,13 +104,6 @@ wait_for() {  # wait_for host sekundy
     return 1
 }
 
-ensure_dns() {
-    if ! getent hosts download.opensuse.org &>/dev/null; then
-        echo "   DNS nie działa - dodaję tymczasowo 8.8.8.8"
-        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-    fi
-}
-
 # ---------------------------------------------------------------------
 # Pakiety: omija blokadę PackageKit, dodaje repozytoria jeśli brak
 # ---------------------------------------------------------------------
@@ -164,7 +159,7 @@ apply_iface() {
                 ipv4.gateway "$gw" ipv4.dns "$dns"
             if [[ -z "$gw" ]]; then nmcli con mod "$con" ipv4.never-default yes; fi
         fi
-        nmcli con up "$con"
+        nmcli -w 30 con up "$con"
     else
         local f="/etc/sysconfig/network/ifcfg-$ifc" r="/etc/sysconfig/network/ifroute-$ifc"
         if [[ "$method" == "dhcp" ]]; then
@@ -183,13 +178,97 @@ apply_iface() {
     fi
 }
 
+# ---------------------------------------------------------------------
+# Samonaprawa internetu
+# ---------------------------------------------------------------------
+net_ok() { ping -c1 -W2 8.8.8.8 &>/dev/null; }
+dns_ok() { getent hosts download.opensuse.org &>/dev/null; }
+
+# fix_internet IFACE [BRAMA_PODPOWIEDZ]  - zwraca 0, gdy internet i DNS działają
+fix_internet() {
+    local ifc="$1" gw_hint="${2:-}" attempt ip4 gw carrier cfg=/etc/sysconfig/network/config
+    if net_ok && dns_ok; then return 0; fi
+    echo "==> Naprawiam internet na $ifc..."
+
+    for attempt in 1 2; do
+        # 1. karta włączona i podłączona
+        ip link set "$ifc" up 2>/dev/null || true
+        sleep 2
+        carrier=$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null || echo 0)
+        if [[ "$carrier" != "1" ]]; then
+            echo "   $ifc nie ma połączenia. VirtualBox: Ustawienia > Sieć > Adapter > 'Kabel podłączony'."
+        fi
+
+        # 2. adres IPv4 (DHCP)
+        ip4=$(ip -4 -o addr show dev "$ifc" scope global | awk '{print $4; exit}' || true)
+        if [[ -z "$ip4" ]]; then
+            echo "   Brak adresu IPv4 - uruchamiam DHCP (próba $attempt)..."
+            apply_iface "$ifc" dhcp || true
+            sleep 3
+            ip4=$(ip -4 -o addr show dev "$ifc" scope global | awk '{print $4; exit}' || true)
+        fi
+
+        # 3. trasa domyślna
+        if [[ -n "$ip4" ]] && ! ip route show default | grep -q '^default'; then
+            gw="$gw_hint"
+            [[ -n "$gw" ]] || gw="${ip4%.*}.2"     # w sieci NAT VirtualBoxa brama kończy się na .2
+            if ping -c1 -W2 "$gw" &>/dev/null; then
+                echo "   Brak trasy domyślnej - dodaję bramę $gw"
+                ip route add default via "$gw" dev "$ifc" || true
+            fi
+        fi
+
+        # 4. DNS
+        if net_ok && ! dns_ok; then
+            echo "   Internet jest, ale DNS nie działa - ustawiam 8.8.8.8"
+            if [[ -f "$cfg" ]] && grep -q '^NETCONFIG_DNS_STATIC_SERVERS=""' "$cfg"; then
+                sed -i 's|^NETCONFIG_DNS_STATIC_SERVERS=.*|NETCONFIG_DNS_STATIC_SERVERS="8.8.8.8 1.1.1.1"|' "$cfg"
+                netconfig update -f || true
+            fi
+            dns_ok || echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+        fi
+
+        if net_ok && dns_ok; then echo "   Internet działa."; return 0; fi
+    done
+
+    echo "BŁĄD: nie udało się naprawić internetu na $ifc."
+    echo "      Sprawdź ustawienia sieci w VirtualBoxie i README (sekcja 'Poradnik: internet')."
+    return 1
+}
+
+# Próbuje naprawić internet po kolei na każdej fizycznej karcie (serwer: nie wiadomo, która to WAN)
+fix_internet_any() {
+    local i first
+    for i in $(ls /sys/class/net); do
+        [[ "$i" == "lo" ]] && continue
+        [[ -e "/sys/class/net/$i/device" ]] || continue
+        [[ -d "/sys/class/net/$i/wireless" ]] && continue
+        echo "   Sprawdzam kartę $i..."
+        if fix_internet "$i"; then return 0; fi
+    done
+    # ostatnia deska ratunku: domyślne adresy sieci NAT VirtualBoxa na pierwszej karcie
+    first=$(phys_iface_except "" || true)
+    if [[ -n "$first" ]]; then
+        echo "   DHCP nie zadziałał - ustawiam adresy domyślnej sieci NAT VirtualBoxa na $first..."
+        apply_iface "$first" static "10.0.2.15/24" "10.0.2.2" "10.0.2.3,8.8.8.8" || true
+        sleep 3
+        net_ok && return 0
+    fi
+    return 1
+}
+
 # =====================================================================
 #  SERWER
 # =====================================================================
 setup_server() {
     local def_wan def_lan wan_ip suggest_lan
     def_wan=$(default_iface || true)
-    [[ -n "$def_wan" ]] || { echo "BŁĄD: serwer nie ma trasy domyślnej (brak internetu na interfejsie WAN)."; exit 1; }
+    if [[ -z "$def_wan" ]]; then
+        echo "==> Serwer nie ma trasy domyślnej - próbuję samodzielnie naprawić internet..."
+        fix_internet_any || true
+        def_wan=$(default_iface || true)
+    fi
+    [[ -n "$def_wan" ]] || { echo "BŁĄD: serwer nie ma internetu. Zobacz README, sekcja 'Poradnik: internet'."; exit 1; }
 
     echo "==> Konfiguracja serwera"
     ask "Interfejs WAN (wychodzi do internetu)" "$def_wan" WAN_IF
@@ -227,8 +306,7 @@ setup_server() {
 
     # 2. Internet na WAN + pakiety
     echo "==> Sprawdzanie internetu na serwerze..."
-    wait_for 8.8.8.8 15 || { echo "BŁĄD: serwer nie ma internetu na $WAN_IF."; exit 1; }
-    ensure_dns
+    fix_internet "$WAN_IF" || { echo "Bez internetu nie da się zainstalować pakietów."; exit 1; }
     echo "==> Instalacja pakietów..."
     install_packages apache2 vsftpd firewalld dnsmasq curl openssh
 
@@ -414,9 +492,8 @@ setup_client() {
     fi
 
     echo "==> Czekam na połączenie z serwerem i internetem..."
-    wait_for "$SRV_IP" 30 || echo "   UWAGA: serwer $SRV_IP nie odpowiada (sprawdź sieć wewnętrzną w VirtualBoxie)."
-    wait_for 8.8.8.8 20 || echo "   UWAGA: brak internetu przez serwer."
-    ensure_dns
+    wait_for "$SRV_IP" 30 || echo "   UWAGA: serwer $SRV_IP nie odpowiada (sprawdź nazwę sieci wewnętrznej w VirtualBoxie)."
+    fix_internet "$IFACE" "$SRV_IP" || { echo "Klient nie ma internetu przez serwer - sprawdź, czy serwer działa (README: Poradnik: internet)."; exit 1; }
     add_hosts_entry "$SRV_IP" "$SRV_NAME"
 
     echo "==> Instalacja narzędzi klienckich..."
